@@ -142,3 +142,4 @@ tbody tr[data-selected="true"] { background: rgba(45, 212, 167, 0.1); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+.noscript { max-width: 1320px; margin: var(--s6) auto; padding: var(--s4); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface); color: var(--muted); }

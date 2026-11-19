@@ -6,7 +6,7 @@
 // token (no market cap, no CoinGecko id, no symbol). Live-token protocols are kept apart and shown
 // with the market's own values, never mixed into the ranked board.
 //
-// Implied value follows only from the snapshot's own figures, through four multipliers:
+// Implied value follows only from the snapshot's own figures, through six multipliers:
 //
 //   category  = the median market-cap / TVL of the live-token protocols in the same category,
 //               when at least three such peers exist; otherwise the global median across all
@@ -14,16 +14,32 @@
 //               price and no category can claim a token worth more than the value it secures.
 //   base      = tvl_usd x category
 //   growth    = 1 + clamp(change_7d, -60, 120) / 100 x 0.5
+//   momentum  = 1 + 0.12 x tanh(change_7d / 30) (lib/signals.ts: a bounded, diminishing-returns
+//               read of the week's move, so one wild week cannot decide the board)
 //   maturity  = 0.6 + min(age_days, 1095) / 1095 x 0.4
 //               (age_days unknown: 365; age is the time since DefiLlama first listed the protocol,
 //               the best record of how long it has run with no token)
 //   breadth   = 1 + 0.02 x min(max(chains - 1, 0), 10)
 //               (a protocol live on more chains reaches more users; capped at 1.20)
-//   implied   = max(1, round(base x growth x maturity x breadth))
+//   crowding  = 1 - 0.2 x HHI(category), floored at 0.8 (lib/signals.ts: the Herfindahl index of
+//               the live-token protocols in the category, so a multiple set by one giant is
+//               discounted and a diffuse category is barely discounted at all)
+//   implied   = max(1, round(base x growth x momentum x maturity x breadth x crowding))
 //
 // No protocol name is ever special-cased: the same function scores every row, and the category
 // multiples are recomputed from the snapshot on every run, so the model finds future protocols
 // early instead of reading a hand-kept list of names.
+
+import {
+  SIGNALS,
+  categoryConcentrations,
+  concentrationList,
+  crowdRange,
+  momentumRange,
+  signalMultipliers,
+  type CategoryConcentration,
+  type SignalConstants,
+} from './signals.ts';
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -49,7 +65,7 @@ export interface Snapshot {
 }
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
-export interface ModelConstants {
+export interface ModelConstants extends SignalConstants {
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -65,6 +81,7 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
+  ...SIGNALS,
   growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
@@ -113,8 +130,11 @@ export interface BoardRow {
     category_peers: number;
     growth_pct: number;
     growth_multiplier: number;
+    momentum_multiplier: number;
     maturity_multiplier: number;
     breadth_multiplier: number;
+    crowd_multiplier: number;
+    crowd_hhi: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -135,8 +155,10 @@ export interface RadarRow {
   implied_value_usd: number;
   category_multiple: number;
   growth_multiplier: number;
+  momentum_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
+  crowd_multiplier: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -157,7 +179,9 @@ export interface CategoryMultiple {
   multiple: number;
 }
 
-/** Everything the dashboard needs: the board, the live set, and the model it runs. */
+/** One category's concentration, for the crowding discount: the dashboard recomputes it from the
+ * same HHI the board carries, so the page and the board agree. A category with no live peer
+ * borrows the global HHI, the same fallback the model uses. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -165,7 +189,9 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   global_multiple: number;
+  global_hhi: number;
   categories: CategoryMultiple[];
+  concentrations: CategoryConcentration[];
   watchlist: string[];
   watchlist_size: number;
   board_size: number;
@@ -247,25 +273,27 @@ export function multipleFor(p: SnapshotProtocol, multiples: { byCategory: Map<st
   return { multiple: multiples.global, peers: 0 };
 }
 
-/** The four multipliers and the implied value one protocol gets under `model`. */
+/** The six multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
   multiples: { byCategory: Map<string, CategoryMultiple>; global: number },
-): { implied: number; categoryMultiple: number; categoryPeers: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null } {
+  concentrations: { byCategory: Map<string, CategoryConcentration>; global: CategoryConcentration },
+): { implied: number; categoryMultiple: number; categoryPeers: number; growthPct: number; growthMult: number; momentumMult: number; maturityMult: number; breadthMult: number; crowdMult: number; crowdHhi: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const { multiple, peers } = multipleFor(protocol, multiples);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = clamp(rawGrowth, model.growth_floor, model.growth_cap);
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const signals = signalMultipliers(protocol, concentrations, model);
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const extraChains = Math.min(Math.max(protocol.chains.length - 1, 0), model.breadth_max_chains);
   const breadthMult = 1 + model.breadth_step * extraChains;
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
-  return { implied, categoryMultiple: multiple, categoryPeers: peers, growthPct, growthMult, maturityMult, breadthMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * signals.momentum * maturityMult * breadthMult * signals.crowd));
+  return { implied, categoryMultiple: multiple, categoryPeers: peers, growthPct, growthMult, momentumMult: signals.momentum, maturityMult, breadthMult, crowdMult: signals.crowd, crowdHhi: signals.hhi, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -306,6 +334,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const multiples = categoryMultiples(snapshot, model);
+  const concentrations = categoryConcentrations(snapshot, model);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
   // the board's coverage is the gate's row and is never gambled on a missing record).
@@ -327,7 +356,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model, multiples);
+    const v = impliedValue(p, snapshot.as_of, model, multiples, concentrations);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -351,8 +380,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       category_peers: s.categoryPeers,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
+      momentum_multiplier: round4(s.momentumMult),
       maturity_multiplier: round4(s.maturityMult),
       breadth_multiplier: round4(s.breadthMult),
+      crowd_multiplier: round4(s.crowdMult),
+      crowd_hhi: round4(s.crowdHhi),
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -490,8 +522,10 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
+    momentum_multiplier: row.model.momentum_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     breadth_multiplier: row.model.breadth_multiplier,
+    crowd_multiplier: row.model.crowd_multiplier,
   };
 }
 
@@ -500,6 +534,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const multiples = categoryMultiples(snapshot, model);
+  const concentrations = categoryConcentrations(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -508,7 +543,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     global_multiple: multiples.global,
+    global_hhi: concentrations.global.hhi,
     categories: [...multiples.byCategory.values()].sort((a, b) => b.multiple - a.multiple),
+    concentrations: concentrationList(concentrations),
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,

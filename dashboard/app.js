@@ -13,7 +13,16 @@
   // above the floor without being on the watchlist.
   var WATCH = {};
   (DATA.watchlist || []).forEach(function (s) { WATCH[s] = true; });
-  var state = { q: '', category: 'all', chain: 'all', minTvl: 0, watchlistOnly: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null, sandbox: false, catScale: 1, growthWeight: DATA.model.growth_weight, maturityFloor: DATA.model.maturity_floor };
+  var state = { q: '', category: 'all', chain: 'all', minTvl: 0, watchlistOnly: false, momentumOnly: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null, sandbox: false, catScale: 1, growthWeight: DATA.model.growth_weight, momentumWeight: DATA.model.momentum_weight, maturityFloor: DATA.model.maturity_floor };
+
+  // One category's concentration, by name, for the crowding discount below.
+  var CONC = {};
+  (DATA.concentrations || []).forEach(function (c) { CONC[c.category] = c; });
+  function crowdOf(row, model) {
+    var c = CONC[row.category || 'Other'];
+    var hhi = c ? c.hhi : DATA.global_hhi;
+    return Math.min(1, Math.max(model.crowd_floor, 1 - model.crowd_weight * hhi));
+  }
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -34,19 +43,23 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // implied = round(tvl x categoryMultiple x growth x maturity x breadth); the sandbox scales the
-  // category multiple and re-weights growth and maturity, and re-sorts the board from the same math.
+  // implied = round(tvl x categoryMultiple x growth x momentum x maturity x breadth x crowd); the
+  // sandbox scales the category multiple and re-weights growth, momentum and maturity, and re-sorts
+  // the board from the same math. Crowding has no sandbox control: it is the category's own discount.
   function impliedOf(row, model, catScale) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
+    var change = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, change));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
+    var momentum = 1 + model.momentum_weight * Math.tanh(change / model.momentum_scale);
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
     var extra = Math.min(Math.max((row.chains || []).length - 1, 0), model.breadth_max_chains);
     var breadth = 1 + model.breadth_step * extra;
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * (catScale || 1) * growthMult * maturity * breadth));
+    var crowd = crowdOf(row, model);
+    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * (catScale || 1) * growthMult * momentum * maturity * breadth * crowd));
   }
   function sandboxImplied(row) {
-    var m = { growth_cap: DATA.model.growth_cap, growth_floor: DATA.model.growth_floor, growth_weight: state.growthWeight, maturity_floor: state.maturityFloor, maturity_range: DATA.model.maturity_range, maturity_days: DATA.model.maturity_days, unknown_age_days: DATA.model.unknown_age_days, breadth_step: DATA.model.breadth_step, breadth_max_chains: DATA.model.breadth_max_chains };
+    var m = { growth_cap: DATA.model.growth_cap, growth_floor: DATA.model.growth_floor, growth_weight: state.growthWeight, momentum_weight: state.momentumWeight, momentum_scale: DATA.model.momentum_scale, crowd_weight: DATA.model.crowd_weight, crowd_floor: DATA.model.crowd_floor, maturity_floor: state.maturityFloor, maturity_range: DATA.model.maturity_range, maturity_days: DATA.model.maturity_days, unknown_age_days: DATA.model.unknown_age_days, breadth_step: DATA.model.breadth_step, breadth_max_chains: DATA.model.breadth_max_chains };
     return impliedOf(row, m, state.catScale);
   }
   function shownImplied(row) { return state.sandbox ? sandboxImplied(row) : row.implied_value_usd; }
@@ -148,6 +161,7 @@
     if (params.get('chain')) state.chain = params.get('chain');
     if (params.get('mintvl')) state.minTvl = Number(params.get('mintvl')) || 0;
     if (params.get('watchlist') === '1') state.watchlistOnly = true;
+    if (params.get('mom') === '1') state.momentumOnly = true;
     if (params.get('tab')) state.tab = params.get('tab');
   }
   function writeHash() {
@@ -157,6 +171,7 @@
     if (state.chain !== 'all') params.set('chain', state.chain);
     if (state.minTvl) params.set('mintvl', String(state.minTvl));
     if (state.watchlistOnly) params.set('watchlist', '1');
+    if (state.momentumOnly) params.set('mom', '1');
     if (state.tab !== 'pre-token') params.set('tab', state.tab);
     if (state.selected) params.set('p', state.selected);
     var next = params.toString();
@@ -170,6 +185,7 @@
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
       if (state.watchlistOnly && !onWatchlist(r)) return false;
+      if (state.momentumOnly && r.momentum_multiplier < 1.05) return false;
       if (state.category !== 'all' && (r.category || 'Other') !== state.category) return false;
       if (state.chain !== 'all' && (r.chains || []).indexOf(state.chain) < 0) return false;
       if (state.minTvl && r.tvl_usd < state.minTvl) return false;
@@ -185,6 +201,7 @@
       if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
+      else if (key === 'momentum') { av = a.momentum_multiplier; bv = b.momentum_multiplier; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else { av = shownImplied(a); bv = shownImplied(b); }
       if (av < bv) return -state.dir;
@@ -262,6 +279,11 @@
       document.createTextNode('Watchlist only')
     );
     wl.querySelector('input').addEventListener('change', function (e) { state.watchlistOnly = e.target.checked; writeHash(); refreshTable(); });
+    var mom = el('label', { class: 'check' },
+      el('input', { type: 'checkbox', checked: state.momentumOnly ? 'checked' : null, 'aria-label': 'High momentum only' }),
+      document.createTextNode('High momentum only')
+    );
+    mom.querySelector('input').addEventListener('change', function (e) { state.momentumOnly = e.target.checked; writeHash(); refreshTable(); });
     var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; writeHash(); render(); } });
     var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; writeHash(); render(); } });
     countEl = el('span', { class: 'count', text: '' });
@@ -271,6 +293,7 @@
       el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chainSel),
       el('div', { class: 'field' }, el('label', { for: 'mintvl', text: 'Min TVL' }), tvlSel),
       wl,
+      mom,
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
       countEl
     );
@@ -291,7 +314,7 @@
       return el('div', { class: 'panel' }, el('div', { class: 'empty' },
         el('h2', { text: 'No protocol matches that filter' }),
         el('p', { text: 'Clear the search or pick another category to see the board again.' }),
-        el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.minTvl = 0; state.watchlistOnly = false; writeHash(); render(); } })
+        el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.minTvl = 0; state.watchlistOnly = false; state.momentumOnly = false; writeHash(); render(); } })
       ));
     }
     var max = Math.max.apply(null, list.map(function (r) { return shownImplied(r); })) || 1;
@@ -299,6 +322,8 @@
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
+      var momentum = 'x' + r.momentum_multiplier.toFixed(2);
+      var momentumClass = r.momentum_multiplier >= 1.05 ? 'pos' : r.momentum_multiplier < 1 ? 'neg' : '';
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
@@ -312,6 +337,7 @@
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
+        el('td', { class: 'num ' + momentumClass, text: momentum }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((shownImplied(r) / max) * 100)) + '%' })),
@@ -330,6 +356,7 @@
             sortHeader('name', 'Protocol'),
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
+            sortHeader('momentum', 'Momentum'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
             el('th', { scope: 'col', text: 'Token' })
@@ -366,6 +393,7 @@
   function modelPanel() {
     var m = DATA.model;
     var topMultis = DATA.categories.filter(function (c) { return c.peers >= 3; }).slice(0, 8);
+    var topConc = (DATA.concentrations || []).slice(0, 8);
     var slider = function (id, label, min, max, step, value, format, set) {
       var input = el('input', { type: 'range', id: id, min: String(min), max: String(max), step: String(step), value: String(value), 'aria-label': label });
       var out = el('output', { for: id, text: format(value) });
@@ -377,20 +405,26 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The category multiple is the median market-cap / TVL of the live-token protocols in that category (at least 3 peers, else the global median ' + DATA.global_multiple + '), clamped to 0.05–1.00.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x categoryMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + 0.02 x min(chains - 1, 10)) )'
+        'implied = round( tvl_usd x categoryMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (1 + ' + m.momentum_weight + ' x tanh(change_7d / ' + m.momentum_scale + ')) x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + 0.02 x min(chains - 1, 10)) x (1 - ' + m.crowd_weight + ' x HHI(category), floored at ' + m.crowd_floor + ') )'
       ),
       el('h3', { text: 'What-if sandbox — re-scores the board live' }),
       el('div', { class: 'sandbox' },
         slider('sb-cat', 'Category multiple scale', 0.5, 2, 0.05, state.catScale, function (v) { return 'x' + v.toFixed(2); }, function (v) { state.catScale = v; }),
         slider('sb-growth', 'Growth weight', 0, 1, 0.05, state.growthWeight, function (v) { return v.toFixed(2); }, function (v) { state.growthWeight = v; }),
+        slider('sb-mom', 'Momentum weight', 0, 0.25, 0.01, state.momentumWeight, function (v) { return v.toFixed(2); }, function (v) { state.momentumWeight = v; }),
         slider('sb-mat', 'Maturity floor', 0.4, 0.8, 0.05, state.maturityFloor, function (v) { return v.toFixed(2); }, function (v) { state.maturityFloor = v; })
       ),
       sandboxNoteEl,
-      el('button', { class: 'button', type: 'button', text: 'Reset sandbox', onclick: function () { state.sandbox = false; state.catScale = 1; state.growthWeight = DATA.model.growth_weight; state.maturityFloor = DATA.model.maturity_floor; render(); } }),
+      el('button', { class: 'button', type: 'button', text: 'Reset sandbox', onclick: function () { state.sandbox = false; state.catScale = 1; state.growthWeight = DATA.model.growth_weight; state.momentumWeight = DATA.model.momentum_weight; state.maturityFloor = DATA.model.maturity_floor; render(); } }),
       el('h3', { text: 'Category multiples from live-token peers' }),
       el('div', { class: 'multis' }, topMultis.map(function (c) {
         return el('div', { class: 'multi' }, el('span', { text: c.category + ' (' + c.peers + ' peers)' }), el('b', { text: 'x' + c.multiple.toFixed(2) }));
       })),
+      el('h3', { text: 'Category concentration — where the multiple is thinnest' }),
+      el('div', { class: 'multis' }, topConc.map(function (c) {
+        return el('div', { class: 'multi' }, el('span', { text: c.category + ' (HHI ' + c.hhi.toFixed(2) + ', ' + c.peers + ' peers)' }), el('b', { text: 'x' + c.multiplier.toFixed(2) }));
+      })),
+      el('p', { class: 'sub', text: 'HHI is the Herfindahl index of the live-token protocols in the category: the sum of their squared shares of the category TVL. A category whose multiple is set by one giant is discounted up to 20%; a diffuse category is barely discounted. Momentum is a bounded read of the week\'s move: a protocol that jumped 120% scores barely more than one that jumped 40%, and a sharp fall is marked down without being written off.' }),
       el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. A protocol on this board records no token in DefiLlama — that is the record, never proof it has none — and the implied value is this entry\u2019s own claim, never make.fun\u2019s. This board does not predict whether or when a token is issued.' })
     );
     return panel;
@@ -423,8 +457,10 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
+        el('div', null, el('span', { text: 'Momentum multiplier' }), el('b', { class: 'num', text: String(row.momentum_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Breadth multiplier' }), el('b', { class: 'num', text: String(row.breadth_multiplier) })),
+        el('div', null, el('span', { text: 'Crowding multiplier' }), el('b', { class: 'num', text: String(row.crowd_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
